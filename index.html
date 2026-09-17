@@ -1,0 +1,2148 @@
+/*
+ ============================================================
+              HUERTO SMART - ESP32
+       Sistema de monitoreo y control desde celular
+ ============================================================
+
+ FUNCIONES:
+ - Temperatura
+ - Humedad
+ - pH
+ - Conductividad eléctrica (CE)
+ - Bomba 1 principal
+ - Bomba 2 secundaria
+ - Placa Peltier
+ - Control manual desde celular
+ - Gráficas
+ - Actualización automática
+ - Servidor web integrado en ESP32
+
+ ============================================================
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DHT.h>
+
+// ============================================================
+//                 CONFIGURACIÓN WIFI
+// ============================================================
+
+// Opción 1: conectar el ESP32 a tu red WiFi
+const char* WIFI_SSID = "TU_WIFI";
+const char* WIFI_PASSWORD = "TU_CONTRASENA";
+
+// ============================================================
+//                 PINES DEL ESP32
+// ============================================================
+
+#define PIN_PH          34
+#define PIN_CE          35
+#define PIN_DHT         32
+
+#define PIN_BOMBA1      25
+#define PIN_BOMBA2      26
+#define PIN_PELTIER     27
+
+// ============================================================
+//                 TIPO DE DHT
+// ============================================================
+
+// Si utilizas DHT11:
+#define DHTTYPE DHT11
+
+// Si utilizas DHT22 cambia la línea anterior por:
+// #define DHTTYPE DHT22
+
+DHT dht(PIN_DHT, DHTTYPE);
+
+WebServer server(80);
+
+// ============================================================
+//                 CONFIGURACIÓN DE RELÉS
+// ============================================================
+
+// Muchos módulos de relé funcionan con lógica INVERTIDA:
+//
+// LOW  = ENCENDIDO
+// HIGH = APAGADO
+//
+// Si tu módulo funciona al revés cambia:
+// RELAY_ON  = HIGH
+// RELAY_OFF = LOW
+
+#define RELAY_ON  LOW
+#define RELAY_OFF HIGH
+
+// ============================================================
+//                 ESTADOS
+// ============================================================
+
+bool bomba1 = false;
+bool bomba2 = false;
+bool peltier = false;
+
+// ============================================================
+//                 VARIABLES DE SENSORES
+// ============================================================
+
+float temperatura = 0.0;
+float humedad = 0.0;
+float ph = 0.0;
+float ce = 0.0;
+
+unsigned long ultimoSensor = 0;
+
+const unsigned long INTERVALO_SENSOR = 3000;
+
+// ============================================================
+//             CONFIGURACIÓN DEL SENSOR pH
+// ============================================================
+//
+// IMPORTANTE:
+// Estos valores son de ejemplo.
+// Debes calibrarlos utilizando soluciones buffer pH 4,
+// pH 7 y, si es necesario, pH 10.
+//
+// La fórmula utilizada inicialmente es:
+//
+// pH = PH7 + (voltajePH - VOLTAJE_PH7) * PENDIENTE_PH
+//
+// La pendiente normalmente será NEGATIVA.
+//
+// ============================================================
+
+const float PH7 = 7.00;
+
+// Voltaje que entrega TU sensor cuando está en solución pH 7
+float VOLTAJE_PH7 = 2.50;
+
+// Ajustar después de calibrar
+float PENDIENTE_PH = -5.70;
+
+// ============================================================
+//             CONFIGURACIÓN SENSOR CE
+// ============================================================
+//
+// La CE depende mucho del módulo utilizado.
+// Por eso dejamos una conversión sencilla que posteriormente
+// puedes calibrar con una solución de conductividad conocida.
+//
+// ============================================================
+
+float FACTOR_CE = 1.00;
+
+// ============================================================
+//                 FUNCIONES DE ACTUADORES
+// ============================================================
+
+void actualizarSalidas() {
+
+  digitalWrite(PIN_BOMBA1, bomba1 ? RELAY_ON : RELAY_OFF);
+
+  digitalWrite(PIN_BOMBA2, bomba2 ? RELAY_ON : RELAY_OFF);
+
+  digitalWrite(PIN_PELTIER, peltier ? RELAY_ON : RELAY_OFF);
+}
+
+
+// ============================================================
+//                 LEER TEMPERATURA/HUMEDAD
+// ============================================================
+
+void leerDHT() {
+
+  float nuevaHumedad = dht.readHumidity();
+  float nuevaTemperatura = dht.readTemperature();
+
+  if (!isnan(nuevaHumedad)) {
+    humedad = nuevaHumedad;
+  }
+
+  if (!isnan(nuevaTemperatura)) {
+    temperatura = nuevaTemperatura;
+  }
+}
+
+
+// ============================================================
+//                     LEER pH
+// ============================================================
+
+void leerPH() {
+
+  int lectura = analogRead(PIN_PH);
+
+  float voltaje = (lectura / 4095.0) * 3.3;
+
+  ph = PH7 + ((voltaje - VOLTAJE_PH7) * PENDIENTE_PH);
+
+  // Limitar para evitar valores absurdos
+  if (ph < 0) ph = 0;
+
+  if (ph > 14) ph = 14;
+}
+
+
+// ============================================================
+//                     LEER CE
+// ============================================================
+
+void leerCE() {
+
+  int lectura = analogRead(PIN_CE);
+
+  float voltaje = (lectura / 4095.0) * 3.3;
+
+  /*
+    Conversión provisional.
+
+    IMPORTANTE:
+    La fórmula exacta depende del módulo de CE utilizado.
+
+    Esta fórmula sirve únicamente como punto de partida
+    para la interfaz.
+
+    Posteriormente se calibra con una solución estándar.
+  */
+
+  ce = voltaje * FACTOR_CE;
+
+  if (ce < 0) {
+    ce = 0;
+  }
+}
+
+
+// ============================================================
+//                 LEER TODOS LOS SENSORES
+// ============================================================
+
+void leerSensores() {
+
+  leerDHT();
+  leerPH();
+  leerCE();
+
+  Serial.println("==============================");
+
+  Serial.print("Temperatura: ");
+  Serial.print(temperatura);
+  Serial.println(" °C");
+
+  Serial.print("Humedad: ");
+  Serial.print(humedad);
+  Serial.println(" %");
+
+  Serial.print("pH: ");
+  Serial.println(ph);
+
+  Serial.print("CE: ");
+  Serial.print(ce);
+  Serial.println(" mS/cm");
+
+  Serial.print("Bomba 1: ");
+  Serial.println(bomba1 ? "ENCENDIDA" : "APAGADA");
+
+  Serial.print("Bomba 2: ");
+  Serial.println(bomba2 ? "ENCENDIDA" : "APAGADA");
+
+  Serial.print("Peltier: ");
+  Serial.println(peltier ? "ENCENDIDA" : "APAGADA");
+}
+
+
+// ============================================================
+//                 GENERAR PÁGINA WEB
+// ============================================================
+
+const char PAGINA_WEB[] PROGMEM = R"rawliteral(
+
+<!DOCTYPE html>
+
+<html lang="es">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta name="viewport"
+content="width=device-width, initial-scale=1.0">
+
+<title>Huerto Smart</title>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<style>
+
+/* ==========================================================
+                       GENERAL
+========================================================== */
+
+*{
+    box-sizing:border-box;
+    margin:0;
+    padding:0;
+    font-family:Arial,Helvetica,sans-serif;
+}
+
+body{
+
+    background:
+    linear-gradient(
+        135deg,
+        #edf8ef,
+        #f8fff9
+    );
+
+    color:#20352a;
+
+    min-height:100vh;
+}
+
+/* ==========================================================
+                       HEADER
+========================================================== */
+
+header{
+
+    background:
+    linear-gradient(
+        135deg,
+        #14532d,
+        #2e8b57
+    );
+
+    color:white;
+
+    padding:25px 20px;
+
+    border-radius:
+    0 0 28px 28px;
+
+    box-shadow:
+    0 5px 20px
+    rgba(0,0,0,.15);
+
+}
+
+.header-content{
+
+    max-width:1000px;
+
+    margin:auto;
+
+}
+
+header h1{
+
+    font-size:29px;
+
+    margin-bottom:5px;
+
+}
+
+header p{
+
+    opacity:.9;
+
+    font-size:14px;
+
+}
+
+/* ==========================================================
+                       ESTADO WIFI
+========================================================== */
+
+.connection{
+
+    margin-top:15px;
+
+    display:inline-flex;
+
+    align-items:center;
+
+    gap:8px;
+
+    background:
+    rgba(255,255,255,.15);
+
+    padding:8px 13px;
+
+    border-radius:20px;
+
+    font-size:13px;
+
+}
+
+.connection-dot{
+
+    width:10px;
+
+    height:10px;
+
+    border-radius:50%;
+
+    background:#55efc4;
+
+    box-shadow:
+    0 0 8px #55efc4;
+
+}
+
+/* ==========================================================
+                       CONTENEDOR
+========================================================== */
+
+.container{
+
+    width:94%;
+
+    max-width:1000px;
+
+    margin:22px auto;
+
+}
+
+/* ==========================================================
+                       TÍTULOS
+========================================================== */
+
+.section-title{
+
+    margin:
+    25px 0 14px;
+
+    font-size:20px;
+
+}
+
+/* ==========================================================
+                    VARIABLES
+========================================================== */
+
+.variables{
+
+    display:grid;
+
+    grid-template-columns:
+    repeat(2,1fr);
+
+    gap:15px;
+
+}
+
+.card{
+
+    background:white;
+
+    border-radius:20px;
+
+    padding:18px;
+
+    box-shadow:
+    0 5px 18px
+    rgba(0,0,0,.07);
+
+    border:
+    1px solid #e5eee7;
+
+}
+
+.card-title{
+
+    color:#64756a;
+
+    font-size:14px;
+
+    margin-bottom:8px;
+
+}
+
+.value{
+
+    font-size:29px;
+
+    font-weight:bold;
+
+    color:#14532d;
+
+}
+
+.unit{
+
+    font-size:14px;
+
+    color:#68776e;
+
+}
+
+.status{
+
+    display:inline-block;
+
+    margin-top:8px;
+
+    padding:5px 9px;
+
+    border-radius:15px;
+
+    font-size:12px;
+
+    background:#e7f7ed;
+
+    color:#16803c;
+
+}
+
+.status.warning{
+
+    background:#fff4d6;
+
+    color:#9a6800;
+
+}
+
+.status.danger{
+
+    background:#ffe6e6;
+
+    color:#c62828;
+
+}
+
+.indicator{
+
+    height:7px;
+
+    background:#e4ece6;
+
+    border-radius:10px;
+
+    margin-top:13px;
+
+    overflow:hidden;
+
+}
+
+.indicator span{
+
+    display:block;
+
+    height:100%;
+
+    width:50%;
+
+    background:#2e8b57;
+
+    border-radius:10px;
+
+    transition:
+    width .5s;
+
+}
+
+/* ==========================================================
+                       CONTROLES
+========================================================== */
+
+.controls{
+
+    display:flex;
+
+    flex-direction:column;
+
+    gap:12px;
+
+}
+
+.control{
+
+    background:white;
+
+    border-radius:18px;
+
+    padding:17px;
+
+    display:flex;
+
+    align-items:center;
+
+    justify-content:space-between;
+
+    box-shadow:
+    0 4px 15px
+    rgba(0,0,0,.07);
+
+}
+
+.control-info{
+
+    display:flex;
+
+    align-items:center;
+
+    gap:12px;
+
+}
+
+.icon{
+
+    width:45px;
+
+    height:45px;
+
+    border-radius:50%;
+
+    background:#eaf7ee;
+
+    display:flex;
+
+    justify-content:center;
+
+    align-items:center;
+
+    font-size:21px;
+
+}
+
+.control h3{
+
+    font-size:15px;
+
+}
+
+.state{
+
+    margin-top:4px;
+
+    font-size:12px;
+
+}
+
+.led{
+
+    width:10px;
+
+    height:10px;
+
+    border-radius:50%;
+
+    display:inline-block;
+
+    margin-right:5px;
+
+}
+
+.led.green{
+
+    background:#20bf6b;
+
+    box-shadow:
+    0 0 8px #20bf6b;
+
+}
+
+.led.red{
+
+    background:#eb3b5a;
+
+}
+
+/* ==========================================================
+                       SWITCH
+========================================================== */
+
+.switch{
+
+    position:relative;
+
+    width:65px;
+
+    height:34px;
+
+}
+
+.switch input{
+
+    opacity:0;
+
+    width:0;
+
+    height:0;
+
+}
+
+.slider{
+
+    position:absolute;
+
+    cursor:pointer;
+
+    inset:0;
+
+    background:#bfc7c2;
+
+    border-radius:30px;
+
+    transition:.3s;
+
+}
+
+.slider:before{
+
+    content:"";
+
+    position:absolute;
+
+    width:26px;
+
+    height:26px;
+
+    left:4px;
+
+    top:4px;
+
+    background:white;
+
+    border-radius:50%;
+
+    transition:.3s;
+
+    box-shadow:
+    0 2px 5px
+    rgba(0,0,0,.2);
+
+}
+
+input:checked + .slider{
+
+    background:#2e8b57;
+
+}
+
+input:checked + .slider:before{
+
+    transform:
+    translateX(31px);
+
+}
+
+/* ==========================================================
+                       GRÁFICAS
+========================================================== */
+
+.chart-card{
+
+    background:white;
+
+    border-radius:20px;
+
+    padding:18px;
+
+    margin-bottom:15px;
+
+    box-shadow:
+    0 5px 18px
+    rgba(0,0,0,.07);
+
+}
+
+.chart-card h3{
+
+    margin-bottom:12px;
+
+    font-size:16px;
+
+}
+
+canvas{
+
+    width:100%!important;
+
+    max-height:240px;
+
+}
+
+/* ==========================================================
+                       FOOTER
+========================================================== */
+
+footer{
+
+    text-align:center;
+
+    padding:30px 10px;
+
+    color:#728078;
+
+    font-size:13px;
+
+}
+
+/* ==========================================================
+                       RESPONSIVE
+========================================================== */
+
+@media(max-width:600px){
+
+    .variables{
+
+        grid-template-columns:
+        repeat(2,1fr);
+
+    }
+
+    .value{
+
+        font-size:24px;
+
+    }
+
+    header h1{
+
+        font-size:24px;
+
+    }
+
+    .card{
+
+        padding:15px;
+
+    }
+
+}
+
+</style>
+
+</head>
+
+
+<body>
+
+
+<header>
+
+<div class="header-content">
+
+<h1>🌱 Huerto Smart</h1>
+
+<p>
+Monitoreo y control inteligente del huerto
+</p>
+
+<div class="connection">
+
+<span class="connection-dot"></span>
+
+ESP32 CONECTADO
+
+</div>
+
+</div>
+
+</header>
+
+
+<div class="container">
+
+
+<!-- =====================================================
+                     VARIABLES
+===================================================== -->
+
+<h2 class="section-title">
+
+🌿 Variables del huerto
+
+</h2>
+
+
+<div class="variables">
+
+
+<!-- TEMPERATURA -->
+
+<div class="card">
+
+<div class="card-title">
+
+🌡️ Temperatura
+
+</div>
+
+<div class="value">
+
+<span id="temperatura">
+-- 
+</span>
+
+<span class="unit">
+°C
+</span>
+
+</div>
+
+<div id="estadoTemp"
+class="status">
+
+Esperando...
+
+</div>
+
+<div class="indicator">
+
+<span id="barraTemp"
+style="width:50%">
+</span>
+
+</div>
+
+</div>
+
+
+<!-- HUMEDAD -->
+
+<div class="card">
+
+<div class="card-title">
+
+💧 Humedad
+
+</div>
+
+<div class="value">
+
+<span id="humedad">
+--
+</span>
+
+<span class="unit">
+%
+</span>
+
+</div>
+
+<div id="estadoHum"
+class="status">
+
+Esperando...
+
+</div>
+
+<div class="indicator">
+
+<span id="barraHum"
+style="width:50%">
+</span>
+
+</div>
+
+</div>
+
+
+<!-- pH -->
+
+<div class="card">
+
+<div class="card-title">
+
+🧪 pH
+
+</div>
+
+<div class="value">
+
+<span id="ph">
+--
+</span>
+
+</div>
+
+<div id="estadoPH"
+class="status">
+
+Esperando...
+
+</div>
+
+<div class="indicator">
+
+<span id="barraPH"
+style="width:50%">
+</span>
+
+</div>
+
+</div>
+
+
+<!-- CE -->
+
+<div class="card">
+
+<div class="card-title">
+
+⚡ Conductividad eléctrica
+
+</div>
+
+<div class="value">
+
+<span id="ce">
+--
+</span>
+
+<span class="unit">
+mS/cm
+</span>
+
+</div>
+
+<div id="estadoCE"
+class="status">
+
+Esperando...
+
+</div>
+
+<div class="indicator">
+
+<span id="barraCE"
+style="width:50%">
+</span>
+
+</div>
+
+</div>
+
+
+</div>
+
+
+<!-- =====================================================
+                     CONTROL
+===================================================== -->
+
+<h2 class="section-title">
+
+⚙️ Control del sistema
+
+</h2>
+
+
+<div class="controls">
+
+
+<!-- BOMBA 1 -->
+
+<div class="control">
+
+<div class="control-info">
+
+<div class="icon">
+💧
+</div>
+
+<div>
+
+<h3>
+Bomba 1 Principal
+</h3>
+
+<div class="state"
+id="estadoBomba1">
+
+<span class="led red"></span>
+
+APAGADA
+
+</div>
+
+</div>
+
+</div>
+
+
+<label class="switch">
+
+<input
+type="checkbox"
+id="bomba1"
+onchange="controlar('bomba1')">
+
+<span class="slider"></span>
+
+</label>
+
+</div>
+
+
+<!-- BOMBA 2 -->
+
+<div class="control">
+
+<div class="control-info">
+
+<div class="icon">
+💧
+</div>
+
+<div>
+
+<h3>
+Bomba 2 Secundaria
+</h3>
+
+<div class="state"
+id="estadoBomba2">
+
+<span class="led red"></span>
+
+APAGADA
+
+</div>
+
+</div>
+
+</div>
+
+
+<label class="switch">
+
+<input
+type="checkbox"
+id="bomba2"
+onchange="controlar('bomba2')">
+
+<span class="slider"></span>
+
+</label>
+
+</div>
+
+
+<!-- PELTIER -->
+
+<div class="control">
+
+<div class="control-info">
+
+<div class="icon">
+❄️
+</div>
+
+<div>
+
+<h3>
+Placa Peltier
+</h3>
+
+<div class="state"
+id="estadoPeltier">
+
+<span class="led red"></span>
+
+APAGADA
+
+</div>
+
+</div>
+
+</div>
+
+
+<label class="switch">
+
+<input
+type="checkbox"
+id="peltier"
+onchange="controlar('peltier')">
+
+<span class="slider"></span>
+
+</label>
+
+</div>
+
+
+</div>
+
+
+<!-- =====================================================
+                     GRÁFICAS
+===================================================== -->
+
+<h2 class="section-title">
+
+📈 Historial de variables
+
+</h2>
+
+
+<div class="chart-card">
+
+<h3>
+🌡️ Temperatura
+</h3>
+
+<canvas id="graficaTemperatura"></canvas>
+
+</div>
+
+
+<div class="chart-card">
+
+<h3>
+💧 Humedad
+</h3>
+
+<canvas id="graficaHumedad"></canvas>
+
+</div>
+
+
+<div class="chart-card">
+
+<h3>
+🧪 pH
+</h3>
+
+<canvas id="graficaPH"></canvas>
+
+</div>
+
+
+<div class="chart-card">
+
+<h3>
+⚡ Conductividad eléctrica
+</h3>
+
+<canvas id="graficaCE"></canvas>
+
+</div>
+
+
+</div>
+
+
+<footer>
+
+🌱 Huerto Smart
+
+<br>
+
+ESP32 • Monitoreo en tiempo real
+
+</footer>
+
+
+<script>
+
+/* ==========================================================
+                     VARIABLES
+========================================================== */
+
+let etiquetas = [];
+
+let datosTemperatura = [];
+let datosHumedad = [];
+let datosPH = [];
+let datosCE = [];
+
+
+/* ==========================================================
+                     CREAR GRÁFICAS
+========================================================== */
+
+function crearGrafica(
+    elemento,
+    etiqueta,
+    datos
+){
+
+    return new Chart(
+        document.getElementById(elemento),
+        {
+
+            type:"line",
+
+            data:{
+
+                labels:etiquetas,
+
+                datasets:[{
+
+                    label:etiqueta,
+
+                    data:datos,
+
+                    borderWidth:3,
+
+                    tension:.35,
+
+                    fill:true
+
+                }]
+
+            },
+
+            options:{
+
+                responsive:true,
+
+                animation:false,
+
+                scales:{
+
+                    y:{
+
+                        beginAtZero:false
+
+                    }
+
+                }
+
+            }
+
+        }
+
+    );
+
+}
+
+
+let graficaTemperatura =
+crearGrafica(
+    "graficaTemperatura",
+    "Temperatura °C",
+    datosTemperatura
+);
+
+
+let graficaHumedad =
+crearGrafica(
+    "graficaHumedad",
+    "Humedad %",
+    datosHumedad
+);
+
+
+let graficaPH =
+crearGrafica(
+    "graficaPH",
+    "pH",
+    datosPH
+);
+
+
+let graficaCE =
+crearGrafica(
+    "graficaCE",
+    "CE mS/cm",
+    datosCE
+);
+
+
+/* ==========================================================
+                  ACTUALIZAR GRÁFICAS
+========================================================== */
+
+function actualizarGrafica(
+    grafica,
+    datos
+){
+
+    grafica.data.labels =
+        etiquetas;
+
+    grafica.data.datasets[0].data =
+        datos;
+
+    grafica.update();
+
+}
+
+
+/* ==========================================================
+                  OBTENER DATOS ESP32
+========================================================== */
+
+async function obtenerDatos(){
+
+    try{
+
+        const respuesta =
+        await fetch(
+            "/datos"
+        );
+
+        const data =
+        await respuesta.json();
+
+
+        /* VARIABLES */
+
+        document.getElementById(
+            "temperatura"
+        ).innerText =
+            data.temperatura.toFixed(1);
+
+
+        document.getElementById(
+            "humedad"
+        ).innerText =
+            data.humedad.toFixed(1);
+
+
+        document.getElementById(
+            "ph"
+        ).innerText =
+            data.ph.toFixed(2);
+
+
+        document.getElementById(
+            "ce"
+        ).innerText =
+            data.ce.toFixed(2);
+
+
+        /* =========================================
+                         ESTADOS
+        ========================================= */
+
+
+        document.getElementById(
+            "estadoTemp"
+        ).innerText =
+            evaluarTemperatura(
+                data.temperatura
+            );
+
+
+        document.getElementById(
+            "estadoHum"
+        ).innerText =
+            evaluarHumedad(
+                data.humedad
+            );
+
+
+        document.getElementById(
+            "estadoPH"
+        ).innerText =
+            evaluarPH(
+                data.ph
+            );
+
+
+        document.getElementById(
+            "estadoCE"
+        ).innerText =
+            evaluarCE(
+                data.ce
+            );
+
+
+        /* =========================================
+                     BARRAS INDICADORAS
+        ========================================= */
+
+        document.getElementById(
+            "barraTemp"
+        ).style.width =
+            limitar(
+                data.temperatura * 3,
+                5,
+                100
+            ) + "%";
+
+
+        document.getElementById(
+            "barraHum"
+        ).style.width =
+            limitar(
+                data.humedad,
+                5,
+                100
+            ) + "%";
+
+
+        document.getElementById(
+            "barraPH"
+        ).style.width =
+            limitar(
+                (data.ph / 14) * 100,
+                5,
+                100
+            ) + "%";
+
+
+        document.getElementById(
+            "barraCE"
+        ).style.width =
+            limitar(
+                data.ce * 30,
+                5,
+                100
+            ) + "%";
+
+
+        /* =========================================
+                     ESTADOS ACTUADORES
+        ========================================= */
+
+        actualizarActuador(
+            "bomba1",
+            "estadoBomba1",
+            data.bomba1
+        );
+
+
+        actualizarActuador(
+            "bomba2",
+            "estadoBomba2",
+            data.bomba2
+        );
+
+
+        actualizarActuador(
+            "peltier",
+            "estadoPeltier",
+            data.peltier
+        );
+
+
+        /* =========================================
+                       HISTORIAL
+        ========================================= */
+
+        const ahora =
+            new Date();
+
+        const hora =
+            ahora.getHours()
+            .toString()
+            .padStart(2,"0")
+            + ":" +
+            ahora.getMinutes()
+            .toString()
+            .padStart(2,"0");
+
+
+        etiquetas.push(hora);
+
+        datosTemperatura.push(
+            data.temperatura
+        );
+
+        datosHumedad.push(
+            data.humedad
+        );
+
+        datosPH.push(
+            data.ph
+        );
+
+        datosCE.push(
+            data.ce
+        );
+
+
+        /*
+          Conservamos únicamente los últimos
+          20 puntos.
+        */
+
+        if(etiquetas.length > 20){
+
+            etiquetas.shift();
+
+            datosTemperatura.shift();
+
+            datosHumedad.shift();
+
+            datosPH.shift();
+
+            datosCE.shift();
+
+        }
+
+
+        actualizarGrafica(
+            graficaTemperatura,
+            datosTemperatura
+        );
+
+        actualizarGrafica(
+            graficaHumedad,
+            datosHumedad
+        );
+
+        actualizarGrafica(
+            graficaPH,
+            datosPH
+        );
+
+        actualizarGrafica(
+            graficaCE,
+            datosCE
+        );
+
+
+    }
+
+    catch(error){
+
+        console.log(
+            "Error de conexión:",
+            error
+        );
+
+    }
+
+}
+
+
+/* ==========================================================
+                     CONTROL ACTUADORES
+========================================================== */
+
+async function controlar(
+    dispositivo
+){
+
+    const elemento =
+        document.getElementById(
+            dispositivo
+        );
+
+    const estado =
+        elemento.checked;
+
+    try{
+
+        await fetch(
+            "/control?" +
+            dispositivo +
+            "=" +
+            (estado ? "1" : "0")
+        );
+
+        obtenerDatos();
+
+    }
+
+    catch(error){
+
+        console.log(
+            "Error al controlar:",
+            error
+        );
+
+    }
+
+}
+
+
+/* ==========================================================
+                   ACTUALIZAR ESTADO
+========================================================== */
+
+function actualizarActuador(
+    checkbox,
+    texto,
+    estado
+){
+
+    document.getElementById(
+        checkbox
+    ).checked = estado;
+
+
+    if(estado){
+
+        document.getElementById(
+            texto
+        ).innerHTML =
+        '<span class="led green"></span> ENCENDIDA';
+
+    }
+
+    else{
+
+        document.getElementById(
+            texto
+        ).innerHTML =
+        '<span class="led red"></span> APAGADA';
+
+    }
+
+}
+
+
+/* ==========================================================
+                    EVALUACIONES
+========================================================== */
+
+function evaluarTemperatura(
+    valor
+){
+
+    if(valor < 15){
+
+        return "Baja";
+
+    }
+
+    if(valor > 32){
+
+        return "Alta";
+
+    }
+
+    return "Normal";
+
+}
+
+
+function evaluarHumedad(
+    valor
+){
+
+    if(valor < 40){
+
+        return "Baja";
+
+    }
+
+    if(valor > 85){
+
+        return "Alta";
+
+    }
+
+    return "Adecuada";
+
+}
+
+
+function evaluarPH(
+    valor
+){
+
+    if(valor < 5.5){
+
+        return "Ácido";
+
+    }
+
+    if(valor > 7.0){
+
+        return "Alcalino";
+
+    }
+
+    return "Óptimo";
+
+}
+
+
+function evaluarCE(
+    valor
+){
+
+    if(valor < 0.8){
+
+        return "Baja";
+
+    }
+
+    if(valor > 2.5){
+
+        return "Alta";
+
+    }
+
+    return "Adecuada";
+
+}
+
+
+/* ==========================================================
+                     LIMITAR VALOR
+========================================================== */
+
+function limitar(
+    valor,
+    minimo,
+    maximo
+){
+
+    return Math.max(
+        minimo,
+        Math.min(
+            maximo,
+            valor
+        )
+    );
+
+}
+
+
+/* ==========================================================
+                ACTUALIZACIÓN AUTOMÁTICA
+========================================================== */
+
+obtenerDatos();
+
+
+setInterval(
+    obtenerDatos,
+    5000
+);
+
+</script>
+
+
+</body>
+
+</html>
+
+)rawliteral";
+
+
+// ============================================================
+//                 PÁGINA PRINCIPAL
+// ============================================================
+
+void paginaPrincipal() {
+
+  server.send_P(
+    200,
+    "text/html",
+    PAGINA_WEB
+  );
+
+}
+
+
+// ============================================================
+//                 ENVIAR DATOS JSON
+// ============================================================
+
+void enviarDatos() {
+
+  String json = "{";
+
+  json += "\"temperatura\":";
+  json += String(temperatura, 2);
+
+  json += ",";
+
+  json += "\"humedad\":";
+  json += String(humedad, 2);
+
+  json += ",";
+
+  json += "\"ph\":";
+  json += String(ph, 2);
+
+  json += ",";
+
+  json += "\"ce\":";
+  json += String(ce, 2);
+
+  json += ",";
+
+  json += "\"bomba1\":";
+  json += bomba1 ? "true" : "false";
+
+  json += ",";
+
+  json += "\"bomba2\":";
+  json += bomba2 ? "true" : "false";
+
+  json += ",";
+
+  json += "\"peltier\":";
+  json += peltier ? "true" : "false";
+
+  json += "}";
+
+  server.send(
+    200,
+    "application/json",
+    json
+  );
+
+}
+
+
+// ============================================================
+//                 CONTROL DESDE WEB
+// ============================================================
+
+void controlarActuadores() {
+
+  if(server.hasArg("bomba1")){
+
+    bomba1 =
+      server.arg("bomba1") == "1";
+
+  }
+
+
+  if(server.hasArg("bomba2")){
+
+    bomba2 =
+      server.arg("bomba2") == "1";
+
+  }
+
+
+  if(server.hasArg("peltier")){
+
+    peltier =
+      server.arg("peltier") == "1";
+
+  }
+
+
+  actualizarSalidas();
+
+  server.send(
+    200,
+    "text/plain",
+    "OK"
+  );
+
+}
+
+
+// ============================================================
+//                     SETUP
+// ============================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  delay(1000);
+
+
+  // ----------------------------------------------------------
+  // Configurar ADC
+  // ----------------------------------------------------------
+
+  analogReadResolution(12);
+
+
+  // ----------------------------------------------------------
+  // Configurar pines
+  // ----------------------------------------------------------
+
+  pinMode(
+    PIN_BOMBA1,
+    OUTPUT
+  );
+
+  pinMode(
+    PIN_BOMBA2,
+    OUTPUT
+  );
+
+  pinMode(
+    PIN_PELTIER,
+    OUTPUT
+  );
+
+
+  // ----------------------------------------------------------
+  // Inicializar actuadores apagados
+  // ----------------------------------------------------------
+
+  bomba1 = false;
+
+  bomba2 = false;
+
+  peltier = false;
+
+  actualizarSalidas();
+
+
+  // ----------------------------------------------------------
+  // Iniciar DHT
+  // ----------------------------------------------------------
+
+  dht.begin();
+
+
+  // ----------------------------------------------------------
+  // Conectar WiFi
+  // ----------------------------------------------------------
+
+  Serial.println();
+
+  Serial.println(
+    "Conectando a WiFi..."
+  );
+
+  WiFi.begin(
+    WIFI_SSID,
+    WIFI_PASSWORD
+  );
+
+
+  int intentos = 0;
+
+
+  while(
+    WiFi.status() != WL_CONNECTED
+    &&
+    intentos < 30
+  ){
+
+    delay(500);
+
+    Serial.print(".");
+
+    intentos++;
+
+  }
+
+
+  Serial.println();
+
+
+  if(
+    WiFi.status() == WL_CONNECTED
+  ){
+
+    Serial.println(
+      "WiFi conectado"
+    );
+
+    Serial.print(
+      "Direccion IP: "
+    );
+
+    Serial.println(
+      WiFi.localIP()
+    );
+
+  }
+
+  else{
+
+    /*
+      Si no consigue conectarse a la red,
+      crea una red WiFi propia.
+    */
+
+    Serial.println(
+      "No se pudo conectar."
+    );
+
+    Serial.println(
+      "Creando red propia..."
+    );
+
+
+    WiFi.mode(
+      WIFI_AP
+    );
+
+
+    WiFi.softAP(
+      "Huerto-Smart",
+      "12345678"
+    );
+
+
+    Serial.print(
+      "Conectate a la red: "
+    );
+
+    Serial.println(
+      "Huerto-Smart"
+    );
+
+
+    Serial.print(
+      "IP del ESP32: "
+    );
+
+    Serial.println(
+      WiFi.softAPIP()
+    );
+
+  }
+
+
+  // ----------------------------------------------------------
+  // RUTAS WEB
+  // ----------------------------------------------------------
+
+  server.on(
+    "/",
+    HTTP_GET,
+    paginaPrincipal
+  );
+
+
+  server.on(
+    "/datos",
+    HTTP_GET,
+    enviarDatos
+  );
+
+
+  server.on(
+    "/control",
+    HTTP_GET,
+    controlarActuadores
+  );
+
+
+  server.begin();
+
+
+  Serial.println(
+    "Servidor web iniciado."
+  );
+
+
+  // Primera lectura
+  leerSensores();
+
+}
+
+
+// ============================================================
+//                     LOOP
+// ============================================================
+
+void loop() {
+
+  server.handleClient();
+
+
+  unsigned long ahora =
+    millis();
+
+
+  if(
+    ahora - ultimoSensor
+    >= INTERVALO_SENSOR
+  ){
+
+    ultimoSensor =
+      ahora;
+
+    leerSensores();
+
+  }
+
+}
